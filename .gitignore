@@ -1,0 +1,6 @@
+report/
+*.hex
+*.bin
+*.uf2
+*.elf
+.build/

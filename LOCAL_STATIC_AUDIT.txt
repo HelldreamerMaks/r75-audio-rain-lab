@@ -1,0 +1,10 @@
+PASS | firmware command 0x29
+PASS | firmware watchdog 350ms
+PASS | spawn gate only at new-drop trigger
+PASS | movement independent of spawn
+PASS | firmware no EEPROM mode write
+PASS | host SignalRGB 1.0.5 gate
+PASS | host 0x22 before private gate
+PASS | host no per-led command 0x24
+PASS | host no VIA brightness value write
+PASS | host no FFT API
