@@ -1,0 +1,242 @@
+name: "02A FIX R75 SAFE AudioSpawn compile report only (NO FLASH)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audio_rain_compile_report:
+    runs-on: ubuntu-latest
+    container: ghcr.io/qmk/qmk_cli:latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Disable git safe-directory checks in disposable runner
+        run: git config --global --add safe.directory '*'
+
+      - name: Checkout this analysis project
+        uses: actions/checkout@v4
+        with:
+          path: project
+
+      - name: Safety self-audit of project scripts/workflows
+        run: |
+          python3 project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD/scripts/audit_project_safety.py \
+            project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD
+
+      - name: Checkout EXACT audited R75 QMK commit
+        uses: actions/checkout@v4
+        with:
+          repository: snakkarike/qmk_firmware
+          ref: b4a935015022a26b184d859a70876d425b6f8c5b
+          submodules: recursive
+          fetch-depth: 1
+          path: qmk
+
+      - name: Create report directory and record toolchain
+        shell: bash
+        run: |
+          mkdir -p project/report/phase2a_fix
+          {
+            echo "expected_commit=b4a935015022a26b184d859a70876d425b6f8c5b"
+            echo -n "actual_commit="
+            git -C qmk rev-parse HEAD
+            echo
+            qmk --version || true
+            arm-none-eabi-gcc --version | head -n 1 || true
+          } | tee project/report/phase2a_fix/ENVIRONMENT.txt
+
+          test "$(git -C qmk rev-parse HEAD)" = "b4a935015022a26b184d859a70876d425b6f8c5b"
+
+      - name: Audit pristine ISO E483 source before overlay
+        run: |
+          python3 project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD/scripts/audit_source.py \
+            qmk \
+            project/report/phase2a_fix/SOURCE_AUDIT_BEFORE.txt
+
+          git -C qmk status --short \
+            | tee project/report/phase2a_fix/GIT_STATUS_BEFORE.txt
+
+          test -z "$(git -C qmk status --porcelain)"
+
+      - name: Prove upstream LED mismatch is still exactly 80 before local override
+        shell: bash
+        run: |
+          grep -n "^#define RGB_MATRIX_LED_COUNT 80$" qmk/keyboards/rk/r75/config.h \
+            | tee project/report/phase2a_fix/UPSTREAM_LED_COUNT.txt
+
+          test "$(grep -c '^#define RGB_MATRIX_LED_COUNT 80$' qmk/keyboards/rk/r75/config.h)" -eq 1
+
+      - name: Apply ONLY keymap-local Audio Spawn Rain overlay plus LED81 override
+        run: |
+          python3 project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD/scripts/apply_overlay.py \
+            project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD \
+            qmk
+
+      - name: Verify ignored VIA files physically exist and exactly match overlay
+        shell: bash
+        run: |
+          TARGET="qmk/keyboards/rk/r75/iso/keymaps/via"
+          SOURCE="project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD"
+
+          # QMK upstream intentionally ignores /keyboards/**/keymaps/via/*.
+          # Therefore these three files will not appear as untracked in normal git status.
+          git -C qmk check-ignore -v \
+            keyboards/rk/r75/iso/keymaps/via/audio_rain.c \
+            keyboards/rk/r75/iso/keymaps/via/config.h \
+            keyboards/rk/r75/iso/keymaps/via/rgb_matrix_user.inc \
+            | tee project/report/phase2a_fix/GIT_IGNORE_PROOF.txt
+
+          test -f "$TARGET/audio_rain.c"
+          test -f "$TARGET/config.h"
+          test -f "$TARGET/rgb_matrix_user.inc"
+
+          cmp -s "$SOURCE/overlay/audio_rain.c" "$TARGET/audio_rain.c"
+          cmp -s "$SOURCE/overlay/rgb_matrix_user.inc" "$TARGET/rgb_matrix_user.inc"
+          cmp -s "$SOURCE/candidate81/config.h" "$TARGET/config.h"
+
+          {
+            echo "===== SOURCE hashes ====="
+            sha256sum \
+              "$SOURCE/overlay/audio_rain.c" \
+              "$SOURCE/overlay/rgb_matrix_user.inc" \
+              "$SOURCE/candidate81/config.h"
+            echo
+            echo "===== TARGET hashes ====="
+            sha256sum \
+              "$TARGET/audio_rain.c" \
+              "$TARGET/rgb_matrix_user.inc" \
+              "$TARGET/config.h"
+          } | tee project/report/phase2a_fix/OVERLAY_SHA256_COMPARISON.txt
+
+          echo "PASS: ignored VIA overlay files physically exist and byte-match project sources." \
+            | tee project/report/phase2a_fix/IGNORED_FILE_CHECK.txt
+
+      - name: Verify tracked source delta is ONLY rules.mk
+        shell: bash
+        run: |
+          git -C qmk status --short \
+            | tee project/report/phase2a_fix/GIT_STATUS_AFTER_OVERLAY.txt
+
+          actual="$(git -C qmk status --porcelain)"
+          expected=" M keyboards/rk/r75/iso/keymaps/via/rules.mk"
+
+          if [ "$actual" != "$expected" ]; then
+            echo "SAFETY STOP: unexpected tracked source delta"
+            echo "Expected: [$expected]"
+            echo "Actual:"
+            printf '%s\n' "$actual"
+            exit 2
+          fi
+
+          git -C qmk diff -- keyboards/rk/r75/iso/keymaps/via/rules.mk \
+            | tee project/report/phase2a_fix/RULES_DIFF.patch
+
+          grep -Fx "RGB_MATRIX_CUSTOM_USER = yes" \
+            qmk/keyboards/rk/r75/iso/keymaps/via/rules.mk
+          grep -Fx "SRC += audio_rain.c" \
+            qmk/keyboards/rk/r75/iso/keymaps/via/rules.mk
+
+          echo "PASS: only tracked delta is intended VIA rules.mk." \
+            | tee project/report/phase2a_fix/TRACKED_DELTA_CHECK.txt
+
+      - name: Record exact overlay source used for compile
+        shell: bash
+        run: |
+          {
+            echo "===== config.h ====="
+            cat qmk/keyboards/rk/r75/iso/keymaps/via/config.h
+            echo
+            echo "===== audio_rain.c ====="
+            cat qmk/keyboards/rk/r75/iso/keymaps/via/audio_rain.c
+            echo
+            echo "===== rgb_matrix_user.inc ====="
+            cat qmk/keyboards/rk/r75/iso/keymaps/via/rgb_matrix_user.inc
+          } > project/report/phase2a_fix/OVERLAY_FILES.txt
+
+      - name: Compile ISO E483 VIA Audio Spawn Rain candidate — COMPILE ONLY
+        working-directory: qmk
+        shell: bash
+        run: |
+          set -o pipefail
+          qmk compile -j 0 -kb rk/r75/iso -km via \
+            2>&1 | tee ../project/report/phase2a_fix/AUDIO_RAIN_COMPILE.log
+
+      - name: Verify Audio Rain symbols reached ELF
+        working-directory: qmk
+        shell: bash
+        run: |
+          mapfile -t elfs < <(find . -maxdepth 3 -type f -name "*.elf" -print)
+
+          if [ "${#elfs[@]}" -ne 1 ]; then
+            echo "SAFETY STOP: expected exactly one ELF, found ${#elfs[@]}"
+            printf '%s\n' "${elfs[@]}"
+            exit 2
+          fi
+
+          ELF="${elfs[0]}"
+          echo "ELF=$ELF" | tee ../project/report/phase2a_fix/ELF_FILE.txt
+
+          arm-none-eabi-nm -a "$ELF" \
+            | grep -E 'audio_rain|via_command_kb|rgb_matrix_user' \
+            | tee ../project/report/phase2a_fix/AUDIO_RAIN_ELF_SYMBOLS.txt
+
+          grep -q "via_command_kb" ../project/report/phase2a_fix/AUDIO_RAIN_ELF_SYMBOLS.txt
+
+      - name: Hash firmware metadata then DELETE firmware images
+        working-directory: qmk
+        shell: bash
+        run: |
+          mapfile -t images < <(
+            find . -maxdepth 3 -type f \
+              \( -name "*.hex" -o -name "*.bin" -o -name "*.uf2" \) \
+              -print | sort
+          )
+
+          if [ "${#images[@]}" -lt 1 ]; then
+            echo "SAFETY STOP: compile produced no firmware image."
+            exit 2
+          fi
+
+          : > ../project/report/phase2a_fix/FIRMWARE_METADATA_ONLY.txt
+
+          for f in "${images[@]}"; do
+            size="$(stat -c '%s' "$f")"
+            sha="$(sha256sum "$f" | awk '{print $1}')"
+            printf 'file=%s\nsize=%s\nsha256=%s\n\n' "$f" "$size" "$sha" \
+              | tee -a ../project/report/phase2a_fix/FIRMWARE_METADATA_ONLY.txt
+          done
+
+          rm -f "${images[@]}"
+
+          if find . -maxdepth 3 -type f \
+            \( -name "*.hex" -o -name "*.bin" -o -name "*.uf2" \) \
+            | grep -q .; then
+            echo "SAFETY STOP: a firmware image remained after deletion."
+            exit 2
+          fi
+
+          echo "PASS: firmware images hashed for metadata and deleted before artifact upload." \
+            | tee ../project/report/phase2a_fix/FIRMWARE_DELETION_CHECK.txt
+
+      - name: Ensure report contains no firmware image
+        shell: bash
+        run: |
+          if find project/report/phase2a_fix -type f \
+            \( -name "*.hex" -o -name "*.bin" -o -name "*.uf2" -o -name "*.disabled" \) \
+            | grep -q .; then
+            echo "SAFETY STOP: report contains a firmware-like file."
+            exit 2
+          fi
+
+          echo "PASS: report is metadata/logs/source only." \
+            | tee project/report/phase2a_fix/REPORT_CONTENT_CHECK.txt
+
+      - name: Upload REPORT ONLY — no firmware image
+        uses: actions/upload-artifact@v4
+        with:
+          name: R75_PHASE2A_FIX_AUDIO_RAIN_COMPILE_REPORT_ONLY
+          path: project/report/phase2a_fix/
+          if-no-files-found: error
