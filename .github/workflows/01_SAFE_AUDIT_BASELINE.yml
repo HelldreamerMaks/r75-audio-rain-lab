@@ -1,0 +1,89 @@
+name: "01 R75 SAFE source audit + stock baseline compile (NO FLASH)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit_baseline:
+    runs-on: ubuntu-latest
+    container: ghcr.io/qmk/qmk_cli:latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Disable git safe-directory checks in disposable runner
+        run: git config --global --add safe.directory '*'
+
+      - name: Checkout this analysis project
+        uses: actions/checkout@v4
+        with:
+          path: project
+
+      - name: Safety self-audit
+        run: |
+          python3 project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD/scripts/audit_project_safety.py \
+          project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD
+
+      - name: Checkout exact R75 QMK fork and branch
+        uses: actions/checkout@v4
+        with:
+          repository: snakkarike/qmk_firmware
+          ref: OpenSignalRGB-2026
+          submodules: recursive
+          fetch-depth: 1
+          path: qmk
+
+      - name: Record exact fork commit
+        working-directory: qmk
+        run: |
+          mkdir -p ../project/report/phase1
+          git rev-parse HEAD | tee ../project/report/phase1/FORK_COMMIT.txt
+          git status --short | tee ../project/report/phase1/FORK_STATUS_BEFORE.txt
+
+      - name: Audit exact ISO E483 sources
+        run: |
+          python3 project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD/scripts/audit_source.py \
+          qmk \
+          project/report/phase1/SOURCE_AUDIT.txt
+
+      - name: Verify requested keyboard target exists
+        working-directory: qmk
+        run: |
+          qmk list-keyboards | grep -Fx 'rk/r75/iso' \
+          | tee ../project/report/phase1/TARGET_FOUND.txt
+
+      - name: Export effective QMK keyboard info
+        working-directory: qmk
+        run: |
+          qmk info -kb rk/r75/iso -f json \
+          > ../project/report/phase1/QMK_INFO_ISO.json
+
+      - name: Compile exact upstream ISO VIA baseline — compile only
+        working-directory: qmk
+        shell: bash
+        run: |
+          set -o pipefail
+          qmk compile -j 0 -kb rk/r75/iso -km via \
+          2>&1 | tee ../project/report/phase1/BASELINE_COMPILE.log
+
+      - name: Describe baseline binary
+        run: |
+          python3 project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD/scripts/postbuild_report.py \
+          qmk \
+          project/report/phase1 \
+          baseline_stock
+
+      - name: Confirm fork source tree status
+        working-directory: qmk
+        run: |
+          git status --short \
+          | tee ../project/report/phase1/FORK_STATUS_AFTER_BASELINE.txt
+
+      - name: Upload analysis only
+        uses: actions/upload-artifact@v4
+        with:
+          name: R75_PHASE1_SAFE_AUDIT_BASELINE
+          path: project/report/phase1/
+          if-no-files-found: error
