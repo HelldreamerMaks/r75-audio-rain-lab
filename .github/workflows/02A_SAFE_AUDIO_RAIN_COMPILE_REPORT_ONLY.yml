@@ -1,0 +1,203 @@
+name: "02A R75 SAFE AudioSpawn compile report only (NO FLASH)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audio_rain_compile_report:
+    runs-on: ubuntu-latest
+    container: ghcr.io/qmk/qmk_cli:latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Disable git safe-directory checks in disposable runner
+        run: git config --global --add safe.directory '*'
+
+      - name: Checkout this analysis project
+        uses: actions/checkout@v4
+        with:
+          path: project
+
+      - name: Safety self-audit of project scripts/workflows
+        run: |
+          python3 project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD/scripts/audit_project_safety.py \
+            project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD
+
+      - name: Checkout EXACT audited R75 QMK commit
+        uses: actions/checkout@v4
+        with:
+          repository: snakkarike/qmk_firmware
+          ref: b4a935015022a26b184d859a70876d425b6f8c5b
+          submodules: recursive
+          fetch-depth: 1
+          path: qmk
+
+      - name: Create report directory and record toolchain
+        shell: bash
+        run: |
+          mkdir -p project/report/phase2a
+          {
+            echo "expected_commit=b4a935015022a26b184d859a70876d425b6f8c5b"
+            echo -n "actual_commit="
+            git -C qmk rev-parse HEAD
+            echo
+            qmk --version || true
+            arm-none-eabi-gcc --version | head -n 1 || true
+          } | tee project/report/phase2a/ENVIRONMENT.txt
+
+          test "$(git -C qmk rev-parse HEAD)" = "b4a935015022a26b184d859a70876d425b6f8c5b"
+
+      - name: Audit pristine ISO E483 source before overlay
+        run: |
+          python3 project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD/scripts/audit_source.py \
+            qmk \
+            project/report/phase2a/SOURCE_AUDIT_BEFORE.txt
+          git -C qmk status --short | tee project/report/phase2a/GIT_STATUS_BEFORE.txt
+          test -z "$(git -C qmk status --porcelain)"
+
+      - name: Prove upstream LED mismatch is still exactly 80 before local override
+        shell: bash
+        run: |
+          grep -n "^#define RGB_MATRIX_LED_COUNT 80$" qmk/keyboards/rk/r75/config.h \
+            | tee project/report/phase2a/UPSTREAM_LED_COUNT.txt
+          test "$(grep -c '^#define RGB_MATRIX_LED_COUNT 80$' qmk/keyboards/rk/r75/config.h)" -eq 1
+
+      - name: Apply ONLY keymap-local Audio Spawn Rain overlay plus LED81 override
+        run: |
+          python3 project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD/scripts/apply_overlay.py \
+            project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD \
+            qmk
+
+      - name: Verify exact source delta after overlay
+        shell: bash
+        run: |
+          git -C qmk status --short | tee project/report/phase2a/GIT_STATUS_AFTER_OVERLAY.txt
+
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              " M keyboards/rk/r75/iso/keymaps/via/rules.mk",
+              "?? keyboards/rk/r75/iso/keymaps/via/audio_rain.c",
+              "?? keyboards/rk/r75/iso/keymaps/via/config.h",
+              "?? keyboards/rk/r75/iso/keymaps/via/rgb_matrix_user.inc",
+          }
+
+          out = subprocess.check_output(
+              ["git", "-C", "qmk", "status", "--porcelain"],
+              text=True,
+          )
+          actual = {line.rstrip("\n") for line in out.splitlines() if line.strip()}
+
+          if actual != expected:
+              print("SAFETY STOP: unexpected source delta")
+              print("Expected:")
+              for x in sorted(expected):
+                  print(repr(x))
+              print("Actual:")
+              for x in sorted(actual):
+                  print(repr(x))
+              raise SystemExit(2)
+
+          print("PASS: source delta is exactly the 4 intended keymap-level files.")
+          PY
+
+          git -C qmk diff -- keyboards/rk/r75/iso/keymaps/via/rules.mk \
+            | tee project/report/phase2a/RULES_DIFF.patch
+
+          {
+            echo "===== config.h ====="
+            cat qmk/keyboards/rk/r75/iso/keymaps/via/config.h
+            echo
+            echo "===== audio_rain.c ====="
+            cat qmk/keyboards/rk/r75/iso/keymaps/via/audio_rain.c
+            echo
+            echo "===== rgb_matrix_user.inc ====="
+            cat qmk/keyboards/rk/r75/iso/keymaps/via/rgb_matrix_user.inc
+          } > project/report/phase2a/OVERLAY_FILES.txt
+
+      - name: Export effective ISO keyboard info
+        working-directory: qmk
+        run: |
+          qmk info -kb rk/r75/iso -f json \
+            > ../project/report/phase2a/QMK_INFO_ISO.json
+
+      - name: Compile Audio Spawn Rain candidate — COMPILE ONLY
+        working-directory: qmk
+        shell: bash
+        run: |
+          set -o pipefail
+          qmk compile -j 0 -kb rk/r75/iso -km via \
+            2>&1 | tee ../project/report/phase2a/AUDIO_RAIN_COMPILE.log
+
+      - name: Verify expected custom symbols exist in ELF
+        working-directory: qmk
+        shell: bash
+        run: |
+          set -euo pipefail
+          elf="$(find . -type f -name 'rk_r75_iso_via.elf' -print -quit)"
+          test -n "$elf"
+          echo "elf=$elf" | tee ../project/report/phase2a/ELF_SYMBOL_CHECK.txt
+
+          arm-none-eabi-nm -a "$elf" \
+            | grep -E 'via_command_kb|AUDIO_DIGITAL_RAIN|g_audio_rain_spawn_gate|g_audio_rain_last_packet_ms' \
+            | tee -a ../project/report/phase2a/ELF_SYMBOL_CHECK.txt
+
+          grep -q 'via_command_kb' ../project/report/phase2a/ELF_SYMBOL_CHECK.txt
+          grep -q 'g_audio_rain_spawn_gate' ../project/report/phase2a/ELF_SYMBOL_CHECK.txt
+          grep -q 'g_audio_rain_last_packet_ms' ../project/report/phase2a/ELF_SYMBOL_CHECK.txt
+
+      - name: Hash firmware outputs for analysis, then delete them
+        working-directory: qmk
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t images < <(find . -maxdepth 2 -type f \
+            \( -name '*.hex' -o -name '*.bin' -o -name '*.uf2' \) -print | sort)
+
+          if [ "${#images[@]}" -eq 0 ]; then
+            echo "No firmware images found after successful compile." >&2
+            exit 2
+          fi
+
+          : > ../project/report/phase2a/FIRMWARE_METADATA_ONLY.txt
+          for f in "${images[@]}"; do
+            size="$(stat -c '%s' "$f")"
+            sha="$(sha256sum "$f" | awk '{print $1}')"
+            printf 'file=%s\nsize=%s\nsha256=%s\n\n' "$f" "$size" "$sha" \
+              | tee -a ../project/report/phase2a/FIRMWARE_METADATA_ONLY.txt
+          done
+
+          # Phase 2A intentionally retains NO firmware image, even inside the disposable runner.
+          rm -f "${images[@]}"
+
+          if find . -maxdepth 2 -type f \
+              \( -name '*.hex' -o -name '*.bin' -o -name '*.uf2' \) | grep -q .; then
+            echo "SAFETY STOP: a firmware image remained after deletion." >&2
+            exit 2
+          fi
+
+          echo "PASS: firmware images hashed for metadata and deleted before artifact upload." \
+            | tee ../project/report/phase2a/FIRMWARE_DELETION_CHECK.txt
+
+      - name: Ensure report contains no firmware image
+        shell: bash
+        run: |
+          if find project/report/phase2a -type f \
+              \( -name '*.hex' -o -name '*.bin' -o -name '*.uf2' -o -name '*.disabled' \) \
+              | grep -q .; then
+            echo "SAFETY STOP: report contains a firmware-like file." >&2
+            exit 2
+          fi
+          echo "PASS: report is metadata/logs/source only." \
+            | tee project/report/phase2a/REPORT_CONTENT_CHECK.txt
+
+      - name: Upload REPORT ONLY — no firmware image
+        uses: actions/upload-artifact@v4
+        with:
+          name: R75_PHASE2A_AUDIO_RAIN_COMPILE_REPORT_ONLY
+          path: project/report/phase2a/
+          if-no-files-found: error
