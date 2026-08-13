@@ -1,0 +1,6 @@
+PASS model_verify
+stock-vs-custom ON parity: 10000 frames
+gate OFF from empty: 20000 frames, 0 drops
+ON -> OFF: existing drops drained naturally
+host protocol order: VIA -> SignalRGB 1.0.5 -> private 0x29
+single-purpose audit: PASS

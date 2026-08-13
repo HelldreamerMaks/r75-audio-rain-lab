@@ -1,0 +1,1 @@
+PASS audio_rain_handler_harness

@@ -1,0 +1,1 @@
+PASS: scanned 5 executable workflow/script files; no firmware flashing/write command patterns found.

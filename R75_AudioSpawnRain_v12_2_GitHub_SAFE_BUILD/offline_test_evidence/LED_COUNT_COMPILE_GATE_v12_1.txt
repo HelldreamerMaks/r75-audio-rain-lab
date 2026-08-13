@@ -1,0 +1,4 @@
+PASS compile-time LED-count gate
+RGB_MATRIX_LED_COUNT=81: compile/run PASS
+RGB_MATRIX_LED_COUNT=80: compile intentionally BLOCKED
+../fork_overlay/keyboards/rk/r75/iso/keymaps/via/audio_rain.c:15:6: error: #error "R75 ISO LED-count safety gate: expected 81; resolve shared config.h=80 vs ISO layout=81 before building for flash"

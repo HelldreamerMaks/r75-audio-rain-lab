@@ -1,0 +1,1 @@
+PASS qmk_effect_harness
