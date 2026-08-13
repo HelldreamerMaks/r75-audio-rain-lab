@@ -1,0 +1,117 @@
+name: "01B R75 SAFE baseline LED81 test (NO FLASH)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  baseline_led81:
+    runs-on: ubuntu-latest
+    container: ghcr.io/qmk/qmk_cli:latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Disable git safe-directory checks
+        run: git config --global --add safe.directory '*'
+
+      - name: Checkout R75 QMK fork
+        uses: actions/checkout@v4
+        with:
+          repository: snakkarike/qmk_firmware
+          ref: OpenSignalRGB-2026
+          submodules: recursive
+          fetch-depth: 1
+          path: qmk
+
+      - name: Record exact commit
+        working-directory: qmk
+        run: |
+          mkdir -p ../report
+          git rev-parse HEAD | tee ../report/FORK_COMMIT.txt
+
+      - name: Show original LED count
+        working-directory: qmk
+        run: |
+          grep -n "RGB_MATRIX_LED_COUNT" keyboards/rk/r75/config.h \
+          | tee ../report/LED_COUNT_BEFORE.txt
+
+      - name: Apply TEMPORARY runner-only ISO LED count fix
+        working-directory: qmk
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("keyboards/rk/r75/config.h")
+          text = p.read_text()
+
+          old = "#define RGB_MATRIX_LED_COUNT 80"
+          new = "#define RGB_MATRIX_LED_COUNT 81"
+
+          if text.count(old) != 1:
+              raise SystemExit(
+                  f"Safety stop: expected exactly one '{old}', found {text.count(old)}"
+              )
+
+          p.write_text(text.replace(old, new))
+          print("Temporary runner-only change: 80 -> 81")
+          PY
+
+          grep -n "RGB_MATRIX_LED_COUNT" keyboards/rk/r75/config.h \
+          | tee ../report/LED_COUNT_AFTER.txt
+
+      - name: Verify ONLY intended source change exists
+        working-directory: qmk
+        shell: bash
+        run: |
+          git status --short | tee ../report/GIT_STATUS.txt
+          git diff -- keyboards/rk/r75/config.h \
+          | tee ../report/CONFIG_DIFF.txt
+
+          changed="$(git status --short | wc -l)"
+          if [ "$changed" -ne 1 ]; then
+            echo "Safety stop: expected exactly one changed file."
+            exit 1
+          fi
+
+          git status --short | grep -Fx " M keyboards/rk/r75/config.h"
+
+      - name: Export effective ISO keyboard info
+        working-directory: qmk
+        run: |
+          qmk info -kb rk/r75/iso -f json \
+          > ../report/QMK_INFO_ISO.json
+
+      - name: Compile ISO VIA baseline with LED81 — COMPILE ONLY
+        working-directory: qmk
+        shell: bash
+        run: |
+          set -o pipefail
+          qmk compile -j 0 -kb rk/r75/iso -km via \
+          2>&1 | tee ../report/BASELINE_LED81_COMPILE.log
+
+      - name: Find generated firmware
+        working-directory: qmk
+        shell: bash
+        run: |
+          find . -maxdepth 2 \
+            \( -name "*.hex" -o -name "*.bin" \) \
+            -type f -print \
+            | tee ../report/GENERATED_FILES.txt
+
+      - name: Hash generated files
+        working-directory: qmk
+        shell: bash
+        run: |
+          find . -maxdepth 2 \
+            \( -name "*.hex" -o -name "*.bin" \) \
+            -type f -exec sha256sum {} \; \
+            | tee ../report/SHA256.txt
+
+      - name: Upload REPORT ONLY
+        uses: actions/upload-artifact@v4
+        with:
+          name: R75_PHASE1B_LED81_BASELINE_REPORT
+          path: report/
+          if-no-files-found: error
