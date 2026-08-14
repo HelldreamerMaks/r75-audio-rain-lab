@@ -1,0 +1,174 @@
+name: "02A FINAL R75 SAFE AudioSpawn compile verification (NO FLASH)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audio_rain_final_verify:
+    runs-on: ubuntu-latest
+    container: ghcr.io/qmk/qmk_cli:latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Disable git safe-directory checks
+        run: git config --global --add safe.directory '*'
+
+      - name: Checkout analysis project
+        uses: actions/checkout@v4
+        with:
+          path: project
+
+      - name: Checkout exact audited R75 QMK commit
+        uses: actions/checkout@v4
+        with:
+          repository: snakkarike/qmk_firmware
+          ref: b4a935015022a26b184d859a70876d425b6f8c5b
+          submodules: recursive
+          fetch-depth: 1
+          path: qmk
+
+      - name: Prepare report
+        shell: bash
+        run: |
+          mkdir -p project/report/phase2a_final
+          {
+            echo "expected_commit=b4a935015022a26b184d859a70876d425b6f8c5b"
+            echo -n "actual_commit="
+            git -C qmk rev-parse HEAD
+            qmk --version || true
+            arm-none-eabi-gcc --version | head -n1 || true
+          } | tee project/report/phase2a_final/ENVIRONMENT.txt
+          test "$(git -C qmk rev-parse HEAD)" = "b4a935015022a26b184d859a70876d425b6f8c5b"
+
+      - name: Apply Audio Spawn Rain overlay
+        run: |
+          python3 project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD/scripts/apply_overlay.py \
+            project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD \
+            qmk
+
+      - name: Verify overlay bytes and LED81
+        shell: bash
+        run: |
+          TARGET="qmk/keyboards/rk/r75/iso/keymaps/via"
+          SOURCE="project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD"
+
+          cmp -s "$SOURCE/overlay/audio_rain.c" "$TARGET/audio_rain.c"
+          cmp -s "$SOURCE/overlay/rgb_matrix_user.inc" "$TARGET/rgb_matrix_user.inc"
+          cmp -s "$SOURCE/candidate81/config.h" "$TARGET/config.h"
+
+          grep -Fx "#define RGB_MATRIX_LED_COUNT 81" "$TARGET/config.h"
+          grep -Fx "RGB_MATRIX_CUSTOM_USER = yes" "$TARGET/rules.mk"
+          grep -Fx "SRC += audio_rain.c" "$TARGET/rules.mk"
+
+          sha256sum \
+            "$TARGET/audio_rain.c" \
+            "$TARGET/rgb_matrix_user.inc" \
+            "$TARGET/config.h" \
+            > project/report/phase2a_final/OVERLAY_HASHES.txt
+
+      - name: Compile ISO E483 Audio Spawn Rain candidate — COMPILE ONLY
+        working-directory: qmk
+        shell: bash
+        run: |
+          set -o pipefail
+          qmk compile -j 0 -kb rk/r75/iso -km via \
+            2>&1 | tee ../project/report/phase2a_final/COMPILE.log
+
+      - name: Verify audio_rain source compiled
+        shell: bash
+        run: |
+          grep -F "audio_rain.c" project/report/phase2a_final/COMPILE.log \
+            | tee project/report/phase2a_final/AUDIO_RAIN_COMPILE_PROOF.txt
+          grep -F "audio_rain.c" project/report/phase2a_final/COMPILE.log | grep -F "[OK]"
+
+      - name: Inspect Audio Rain object before final LTO effects
+        working-directory: qmk
+        shell: bash
+        run: |
+          mapfile -t objs < <(find .build -type f -name "*audio_rain*.o" -print | sort)
+          printf '%s\n' "${objs[@]}" | tee ../project/report/phase2a_final/AUDIO_RAIN_OBJECTS.txt
+
+          if [ "${#objs[@]}" -lt 1 ]; then
+            echo "SAFETY STOP: audio_rain object not found."
+            exit 2
+          fi
+
+          : > ../project/report/phase2a_final/AUDIO_RAIN_OBJECT_SYMBOLS.txt
+          for obj in "${objs[@]}"; do
+            echo "===== $obj =====" | tee -a ../project/report/phase2a_final/AUDIO_RAIN_OBJECT_SYMBOLS.txt
+            arm-none-eabi-nm -a "$obj" 2>/dev/null \
+              | grep -E 'via_command_kb|g_audio_rain_spawn_gate|g_audio_rain_last_packet_ms' \
+              | tee -a ../project/report/phase2a_final/AUDIO_RAIN_OBJECT_SYMBOLS.txt || true
+          done
+
+          # If LTO object symbol display is limited, source + successful compile/link remain authoritative.
+          # Do not fail solely because LTO hides/interprets a symbol here.
+
+      - name: Verify final ELF contains Audio Rain linked state
+        working-directory: qmk
+        shell: bash
+        run: |
+          mapfile -t elfs < <(find . -maxdepth 3 -type f -name "*.elf" -print)
+          test "${#elfs[@]}" -eq 1
+          ELF="${elfs[0]}"
+          echo "ELF=$ELF" | tee ../project/report/phase2a_final/ELF_FILE.txt
+
+          arm-none-eabi-nm -a "$ELF" \
+            | grep -E 'g_audio_rain_spawn_gate|g_audio_rain_last_packet_ms' \
+            | tee ../project/report/phase2a_final/FINAL_ELF_AUDIO_STATE.txt
+
+          grep -q "g_audio_rain_spawn_gate" ../project/report/phase2a_final/FINAL_ELF_AUDIO_STATE.txt
+          grep -q "g_audio_rain_last_packet_ms" ../project/report/phase2a_final/FINAL_ELF_AUDIO_STATE.txt
+
+      - name: Record firmware metadata then delete images
+        working-directory: qmk
+        shell: bash
+        run: |
+          mapfile -t images < <(
+            find . -maxdepth 3 -type f \
+              \( -name "*.hex" -o -name "*.bin" -o -name "*.uf2" \) \
+              -print | sort
+          )
+
+          test "${#images[@]}" -ge 1
+          : > ../project/report/phase2a_final/FIRMWARE_METADATA_ONLY.txt
+
+          for f in "${images[@]}"; do
+            {
+              echo "file=$f"
+              echo "size=$(stat -c '%s' "$f")"
+              echo "sha256=$(sha256sum "$f" | awk '{print $1}')"
+              echo
+            } | tee -a ../project/report/phase2a_final/FIRMWARE_METADATA_ONLY.txt
+          done
+
+          rm -f "${images[@]}"
+
+          if find . -maxdepth 3 -type f \
+            \( -name "*.hex" -o -name "*.bin" -o -name "*.uf2" \) \
+            | grep -q .; then
+            echo "SAFETY STOP: firmware image remained after deletion."
+            exit 2
+          fi
+
+      - name: Ensure report has no firmware image
+        shell: bash
+        run: |
+          if find project/report/phase2a_final -type f \
+            \( -name "*.hex" -o -name "*.bin" -o -name "*.uf2" -o -name "*.disabled" \) \
+            | grep -q .; then
+            echo "SAFETY STOP: report contains firmware image."
+            exit 2
+          fi
+          echo "PASS: report contains logs/metadata only." \
+            | tee project/report/phase2a_final/REPORT_CONTENT_CHECK.txt
+
+      - name: Upload report only
+        uses: actions/upload-artifact@v4
+        with:
+          name: R75_PHASE2A_FINAL_AUDIO_RAIN_VERIFY_REPORT
+          path: project/report/phase2a_final/
+          if-no-files-found: error
