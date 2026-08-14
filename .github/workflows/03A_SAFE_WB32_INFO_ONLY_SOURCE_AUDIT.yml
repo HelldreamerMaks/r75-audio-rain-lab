@@ -1,0 +1,491 @@
+name: "03A R75 SAFE WB32 info-only source audit (NO DEVICE / NO FLASH)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wb32_info_only_audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      WB32_UPDATER_COMMIT: 656f6a56354de86a8213b0d2dc8349b0aeb4b67e
+      R75_QMK_COMMIT: b4a935015022a26b184d859a70876d425b6f8c5b
+
+    steps:
+      - name: Checkout this project
+        uses: actions/checkout@v4
+        with:
+          path: project
+
+      - name: Checkout exact official Westberry updater source
+        uses: actions/checkout@v4
+        with:
+          repository: WestberryTech/wb32-dfu-updater
+          ref: 656f6a56354de86a8213b0d2dc8349b0aeb4b67e
+          fetch-depth: 1
+          path: westberry
+
+      - name: Checkout exact audited R75 QMK source
+        uses: actions/checkout@v4
+        with:
+          repository: snakkarike/qmk_firmware
+          ref: b4a935015022a26b184d859a70876d425b6f8c5b
+          fetch-depth: 1
+          path: qmk
+
+      - name: Create report directories
+        shell: bash
+        run: |
+          mkdir -p project/phase3a/report
+          mkdir -p project/phase3a/source
+
+      - name: Verify exact commits
+        shell: bash
+        run: |
+          W="$(git -C westberry rev-parse HEAD)"
+          Q="$(git -C qmk rev-parse HEAD)"
+
+          {
+            echo "WB32_EXPECTED=$WB32_UPDATER_COMMIT"
+            echo "WB32_ACTUAL=$W"
+            echo "R75_QMK_EXPECTED=$R75_QMK_COMMIT"
+            echo "R75_QMK_ACTUAL=$Q"
+          } | tee project/phase3a/report/COMMITS.txt
+
+          test "$W" = "$WB32_UPDATER_COMMIT"
+          test "$Q" = "$R75_QMK_COMMIT"
+
+      - name: Prove R75 target identity from exact QMK source
+        shell: bash
+        run: |
+          JSON="qmk/keyboards/rk/r75/iso/keyboard.json"
+          README="qmk/keyboards/rk/r75/iso/readme.md"
+
+          python3 - <<'PY' | tee project/phase3a/report/R75_TARGET_AUDIT.txt
+          import json
+          p = "qmk/keyboards/rk/r75/iso/keyboard.json"
+          with open(p, encoding="utf-8") as f:
+              d = json.load(f)
+
+          print("keyboard_name =", d.get("keyboard_name"))
+          print("processor     =", d.get("processor"))
+          print("bootloader    =", d.get("bootloader"))
+          print("usb           =", d.get("usb"))
+          print("raw_feature   =", d.get("features", {}).get("raw"))
+
+          assert d.get("keyboard_name") == "Royal Kludge R75 ISO"
+          assert d.get("processor") == "WB32FQ95"
+          assert d.get("bootloader") == "wb32-dfu"
+          assert d.get("usb", {}).get("pid") == "0xE483"
+          PY
+
+          {
+            echo
+            echo "===== Bootloader-entry text present in repository README ====="
+            grep -n -E "Reset switch|Escape key|R_Shift" "$README" || true
+            echo
+            echo "NOTE: README heading identifies another RK model, so these physical"
+            echo "instructions are evidence to verify on the real R75, not yet a guarantee."
+          } >> project/phase3a/report/R75_TARGET_AUDIT.txt
+
+      - name: Audit official updater readback safety
+        shell: bash
+        run: |
+          DEV="westberry/src_common/dfufwdevice.c"
+          FW="westberry/src_common/dfufw.c"
+          CMD="westberry/src_common/cmdinfo.h"
+
+          {
+            echo "===== Official protocol constants ====="
+            grep -n -E "CMD_GET_INFO|CMD_ERASE|CMD_WRITE_PAGE|CMD_READ|CMD_RESET|CMD_GO|CMD_BACK_READ_PROTECT" "$CMD"
+            echo
+            echo "===== Official upload path ====="
+            grep -n -A28 "int dfufw_opt_upload" "$FW"
+            echo
+            echo "===== READ_PROTECT handling in read path ====="
+            grep -n -A18 -B5 "read_data_buffer\[1\] == CMD_BACK_READ_PROTECT" "$DEV" | tail -n 50
+            echo
+            echo "===== Protection-disable procedure evidence ====="
+            grep -n -A120 "void fn_unread_protection" "$DEV" | head -n 125
+          } > project/phase3a/report/OFFICIAL_UPDATER_SAFETY_AUDIT.txt
+
+          # Hard assertions: if upstream changed, stop rather than assuming.
+          grep -q "#define CMD_GET_INFO 0X01" "$CMD"
+          grep -q "#define CMD_READ 0x72" "$CMD"
+          grep -q "fn_unread_protection(pdfu);" "$DEV"
+          grep -q "fn_program_page(pdfu, INFO4_ADDR" "$DEV"
+          grep -q "fn_program_page(pdfu, INFO5_ADDR" "$DEV"
+          grep -q "fn_program_page(pdfu, INFO6_ADDR" "$DEV"
+          grep -q "fn_read_data(pdfu, 0x8000000, read_buf, size);" "$FW"
+
+          echo "PASS: stock -U path is not accepted as fail-closed read-only." \
+            | tee -a project/phase3a/report/OFFICIAL_UPDATER_SAFETY_AUDIT.txt
+
+      - name: Generate minimal WB32 INFO-ONLY inspector source
+        shell: bash
+        run: |
+          cat > project/phase3a/source/r75_wb32_info_only.c <<'EOF'
+          /*
+           * R75 / WB32 DFU INFO-ONLY inspector.
+           *
+           * Purpose:
+           *   --list : enumerate only WB32 factory DFU USB ID 342D:DFA0
+           *   --info : issue exactly one WB32 GET_INFO command (0x01, info id 0x00)
+           *
+           * There is intentionally no firmware read, erase, program, reset,
+           * protection-change, download, upload, or jump functionality.
+           *
+           * Protocol behavior is based on WestberryTech/wb32-dfu-updater,
+           * audited at commit 656f6a56354de86a8213b0d2dc8349b0aeb4b67e.
+           */
+
+          #include <stdio.h>
+          #include <stdint.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <libusb-1.0/libusb.h>
+
+          #define WB_VID 0x342D
+          #define WB_DFU_PID 0xDFA0
+          #define WB_EP_OUT 0x01
+          #define WB_EP_IN  0x81
+          #define WB_CMD_GET_INFO 0x01
+          #define USB_TIMEOUT_MS 2000
+
+          static uint32_t le32(const unsigned char *p) {
+              return ((uint32_t)p[0]) |
+                     ((uint32_t)p[1] << 8) |
+                     ((uint32_t)p[2] << 16) |
+                     ((uint32_t)p[3] << 24);
+          }
+
+          static int is_target(libusb_device *dev, struct libusb_device_descriptor *desc) {
+              if (libusb_get_device_descriptor(dev, desc) != 0) return 0;
+              return desc->idVendor == WB_VID && desc->idProduct == WB_DFU_PID;
+          }
+
+          static int list_targets(libusb_context *ctx) {
+              libusb_device **list = NULL;
+              ssize_t n = libusb_get_device_list(ctx, &list);
+              if (n < 0) {
+                  fprintf(stderr, "libusb_get_device_list failed: %s\n",
+                          libusb_error_name((int)n));
+                  return 2;
+              }
+
+              int found = 0;
+              for (ssize_t i = 0; i < n; ++i) {
+                  struct libusb_device_descriptor d;
+                  if (!is_target(list[i], &d)) continue;
+                  ++found;
+                  printf("WB32_DFU_FOUND vid=%04X pid=%04X bus=%u address=%u bcdDevice=%04X\n",
+                         d.idVendor, d.idProduct,
+                         (unsigned)libusb_get_bus_number(list[i]),
+                         (unsigned)libusb_get_device_address(list[i]),
+                         d.bcdDevice);
+              }
+
+              libusb_free_device_list(list, 1);
+              printf("WB32_DFU_COUNT=%d\n", found);
+              return found ? 0 : 3;
+          }
+
+          static int verify_interface_shape(libusb_device *dev) {
+              struct libusb_config_descriptor *cfg = NULL;
+              int r = libusb_get_config_descriptor(dev, 0, &cfg);
+              if (r != 0 || !cfg) return 0;
+
+              int ok = 0;
+              if (cfg->bNumInterfaces == 1 &&
+                  cfg->interface[0].num_altsetting >= 1) {
+                  const struct libusb_interface_descriptor *it =
+                      &cfg->interface[0].altsetting[0];
+
+                  int have_in = 0, have_out = 0;
+                  for (int i = 0; i < it->bNumEndpoints; ++i) {
+                      unsigned char ep = it->endpoint[i].bEndpointAddress;
+                      if (ep == WB_EP_IN) have_in = 1;
+                      if (ep == WB_EP_OUT) have_out = 1;
+                  }
+
+                  ok = (it->bInterfaceClass == 0xFF &&
+                        it->bInterfaceSubClass == 0xFF &&
+                        it->bNumEndpoints == 2 &&
+                        have_in && have_out);
+              }
+
+              libusb_free_config_descriptor(cfg);
+              return ok;
+          }
+
+          static int query_info(libusb_context *ctx) {
+              libusb_device **list = NULL;
+              ssize_t n = libusb_get_device_list(ctx, &list);
+              if (n < 0) {
+                  fprintf(stderr, "libusb_get_device_list failed: %s\n",
+                          libusb_error_name((int)n));
+                  return 2;
+              }
+
+              libusb_device *target = NULL;
+              struct libusb_device_descriptor desc;
+              int count = 0;
+
+              for (ssize_t i = 0; i < n; ++i) {
+                  struct libusb_device_descriptor d;
+                  if (!is_target(list[i], &d)) continue;
+                  target = list[i];
+                  desc = d;
+                  ++count;
+              }
+
+              if (count != 1 || !target) {
+                  fprintf(stderr, "INFO requires exactly one WB32 DFU device; found %d\n", count);
+                  libusb_free_device_list(list, 1);
+                  return 3;
+              }
+
+              if (!verify_interface_shape(target)) {
+                  fprintf(stderr, "Device USB interface shape does not match audited WB32 DFU.\n");
+                  libusb_free_device_list(list, 1);
+                  return 4;
+              }
+
+              libusb_device_handle *h = NULL;
+              int r = libusb_open(target, &h);
+              if (r != 0 || !h) {
+                  fprintf(stderr, "Cannot open WB32 DFU device: %s\n", libusb_error_name(r));
+                  libusb_free_device_list(list, 1);
+                  return 5;
+              }
+
+              unsigned char manufacturer[128] = {0};
+              unsigned char product[128] = {0};
+
+              if (desc.iManufacturer) {
+                  libusb_get_string_descriptor_ascii(
+                      h, desc.iManufacturer, manufacturer, sizeof(manufacturer) - 1);
+              }
+              if (desc.iProduct) {
+                  libusb_get_string_descriptor_ascii(
+                      h, desc.iProduct, product, sizeof(product) - 1);
+              }
+
+              printf("USB_MANUFACTURER=%s\n", manufacturer[0] ? (char *)manufacturer : "(unavailable)");
+              printf("USB_PRODUCT=%s\n", product[0] ? (char *)product : "(unavailable)");
+
+              r = libusb_claim_interface(h, 0);
+              if (r != 0) {
+                  fprintf(stderr, "Cannot claim interface 0: %s\n", libusb_error_name(r));
+                  libusb_close(h);
+                  libusb_free_device_list(list, 1);
+                  return 6;
+              }
+
+              /*
+               * The ONLY WB32 protocol command emitted by this program:
+               * GET_INFO (0x01), info_id 0x00.
+               */
+              unsigned char cmd[2] = {WB_CMD_GET_INFO, 0x00};
+              int transferred = 0;
+
+              r = libusb_bulk_transfer(
+                  h, WB_EP_OUT, cmd, (int)sizeof(cmd),
+                  &transferred, USB_TIMEOUT_MS);
+
+              if (r != 0 || transferred != (int)sizeof(cmd)) {
+                  fprintf(stderr, "GET_INFO OUT failed: %s transferred=%d\n",
+                          libusb_error_name(r), transferred);
+                  libusb_release_interface(h, 0);
+                  libusb_close(h);
+                  libusb_free_device_list(list, 1);
+                  return 7;
+              }
+
+              unsigned char rsp[256] = {0};
+              transferred = 0;
+              r = libusb_bulk_transfer(
+                  h, WB_EP_IN, rsp, (int)sizeof(rsp),
+                  &transferred, USB_TIMEOUT_MS);
+
+              libusb_release_interface(h, 0);
+              libusb_close(h);
+              libusb_free_device_list(list, 1);
+
+              if (r != 0) {
+                  fprintf(stderr, "GET_INFO IN failed: %s\n", libusb_error_name(r));
+                  return 8;
+              }
+              if (transferred < 16) {
+                  fprintf(stderr, "GET_INFO response too short: %d\n", transferred);
+                  return 9;
+              }
+              if (rsp[1] != 0x00) {
+                  fprintf(stderr, "GET_INFO status is not success: 0x%02X\n", rsp[1]);
+                  return 10;
+              }
+              if (rsp[2] < 13 || transferred < 3 + rsp[2]) {
+                  fprintf(stderr, "GET_INFO payload length invalid: %u / transferred=%d\n",
+                          rsp[2], transferred);
+                  return 11;
+              }
+
+              const unsigned char *info = &rsp[3];
+              uint8_t boot = info[0];
+              uint32_t chip_id = le32(&info[1]);
+              uint32_t flash_size = le32(&info[5]);
+              uint32_t sram_size = le32(&info[9]);
+
+              printf("GET_INFO_STATUS=PASS\n");
+              printf("BOOTLOADER_VERSION=%u.%u\n", boot >> 4, boot & 0x0F);
+              printf("CHIP_ID=0x%08X\n", chip_id);
+              printf("FLASH_SIZE_BYTES=%u\n", flash_size);
+              printf("FLASH_SIZE_KIB=%u\n", flash_size >> 10);
+              printf("SRAM_SIZE_BYTES=%u\n", sram_size);
+              printf("SRAM_SIZE_KIB=%u\n", sram_size >> 10);
+              printf("CHIP_ID_MASK_0x3FFF=0x%04X\n", chip_id & 0x3FFF);
+
+              return 0;
+          }
+
+          static void usage(const char *exe) {
+              fprintf(stderr,
+                      "R75 WB32 INFO-ONLY inspector\n"
+                      "Usage: %s --list | --info\n"
+                      "--list performs USB enumeration only.\n"
+                      "--info sends exactly one WB32 GET_INFO query.\n",
+                      exe);
+          }
+
+          int main(int argc, char **argv) {
+              if (argc != 2) {
+                  usage(argv[0]);
+                  return 64;
+              }
+
+              libusb_context *ctx = NULL;
+              int r = libusb_init(&ctx);
+              if (r != 0) {
+                  fprintf(stderr, "libusb_init failed: %s\n", libusb_error_name(r));
+                  return 2;
+              }
+
+              int rc;
+              if (strcmp(argv[1], "--list") == 0) {
+                  rc = list_targets(ctx);
+              } else if (strcmp(argv[1], "--info") == 0) {
+                  rc = query_info(ctx);
+              } else {
+                  usage(argv[0]);
+                  rc = 64;
+              }
+
+              libusb_exit(ctx);
+              return rc;
+          }
+          EOF
+
+      - name: HARD GATE — source exposes only LIST and GET_INFO
+        shell: bash
+        run: |
+          SRC="project/phase3a/source/r75_wb32_info_only.c"
+
+          {
+            echo "===== Mode strings ====="
+            grep -n -E -- "--list|--info" "$SRC"
+            echo
+            echo "===== Protocol command definition ====="
+            grep -n "WB_CMD_GET_INFO" "$SRC"
+          } | tee project/phase3a/report/INFO_ONLY_SOURCE_AUDIT.txt
+
+          # The inspector must not contain WB32 mutating/read-flash protocol constants.
+          # These checks intentionally fail closed.
+          for banned in \
+            "0x5E" "0X5E" \
+            "0x6A" "0X6A" \
+            "0x72" "0X72" \
+            "0x83" "0X83" \
+            "0x9B" "0X9B" \
+            "CMD_ERASE" "CMD_WRITE_PAGE" "CMD_READ" "CMD_RESET" "CMD_GO" \
+            "fn_unread_protection" "fn_program_page" "fn_erase"; do
+              if grep -q "$banned" "$SRC"; then
+                echo "SAFETY STOP: forbidden protocol/write token found: $banned"
+                exit 2
+              fi
+          done
+
+          test "$(grep -c '^#define WB_CMD_GET_INFO 0x01$' "$SRC")" -eq 1
+          test "$(grep -c 'unsigned char cmd\[2\] = {WB_CMD_GET_INFO, 0x00};' "$SRC")" -eq 1
+
+          echo "PASS: source contains no flash-read/write/erase/reset/go command constants." \
+            | tee -a project/phase3a/report/INFO_ONLY_SOURCE_AUDIT.txt
+
+      - name: Install Linux compile dependency
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc libusb-1.0-0-dev binutils
+
+      - name: Compile INFO-ONLY inspector for cloud static validation
+        shell: bash
+        run: |
+          gcc \
+            -std=c11 -O2 -Wall -Wextra -Werror \
+            project/phase3a/source/r75_wb32_info_only.c \
+            $(pkg-config --cflags --libs libusb-1.0) \
+            -o project/phase3a/r75_wb32_info_only_linux
+
+          file project/phase3a/r75_wb32_info_only_linux \
+            | tee project/phase3a/report/BUILD_FILE.txt
+
+          sha256sum \
+            project/phase3a/source/r75_wb32_info_only.c \
+            project/phase3a/r75_wb32_info_only_linux \
+            | tee project/phase3a/report/SHA256SUMS.txt
+
+      - name: Static symbol/import audit
+        shell: bash
+        run: |
+          BIN="project/phase3a/r75_wb32_info_only_linux"
+
+          {
+            echo "===== Undefined/imported symbols ====="
+            nm -u "$BIN" || true
+            echo
+            echo "===== Selected strings ====="
+            strings "$BIN" | grep -E "GET_INFO|WB32|FLASH_SIZE|CHIP_ID|libusb" || true
+          } > project/phase3a/report/BINARY_STATIC_AUDIT.txt
+
+          # This binary is only for cloud validation; it is NOT the Windows live tool.
+          echo "PASS: Linux compile/static validation completed." \
+            | tee project/phase3a/report/BUILD_PASS.txt
+
+      - name: Prove no physical device access occurred
+        shell: bash
+        run: |
+          {
+            echo "GitHub-hosted runner has no user's R75 attached."
+            echo "The compiled inspector was NOT invoked with --list or --info."
+            echo "No DFU command was sent to any user device."
+            echo "No firmware read/write/erase/reset operation was performed."
+          } | tee project/phase3a/report/NO_DEVICE_ACCESS.txt
+
+      - name: Remove validation executable before artifact
+        shell: bash
+        run: |
+          rm -f project/phase3a/r75_wb32_info_only_linux
+          test ! -f project/phase3a/r75_wb32_info_only_linux
+
+      - name: Upload Phase 3A report + source only
+        uses: actions/upload-artifact@v4
+        with:
+          name: R75_PHASE3A_WB32_INFO_ONLY_SOURCE_AUDIT
+          path: |
+            project/phase3a/report/
+            project/phase3a/source/
+          if-no-files-found: error
