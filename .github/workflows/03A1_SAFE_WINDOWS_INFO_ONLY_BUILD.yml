@@ -1,0 +1,867 @@
+name: "03A.1 R75 SAFE Windows INFO-only build (NO DEVICE INFO / NO FLASH)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build_windows_info_only:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    env:
+      EXPECTED_SOURCE_SHA256: 50b1bf8243b306c509b9cd221be79b6cda3cde4c075a30d55b8a9e6226e99296
+
+    steps:
+      - name: Checkout this project
+        uses: actions/checkout@v4
+        with:
+          path: project
+
+      - name: Setup MSYS2 UCRT64 build environment
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-libusb
+
+      - name: Create Phase 3A.1 directories
+        shell: msys2 {0}
+        run: |
+          mkdir -p project/phase3a1/source
+          mkdir -p project/phase3a1/report
+          mkdir -p project/phase3a1/artifact
+
+      - name: Generate EXACT green Phase 3A audited source
+        shell: msys2 {0}
+        run: |
+          cat > project/phase3a1/source/r75_wb32_info_only.c <<'EOF'
+          /*
+           * R75 / WB32 DFU INFO-ONLY inspector.
+           *
+           * Purpose:
+           *   --list : enumerate only WB32 factory DFU USB ID 342D:DFA0
+           *   --info : issue exactly one WB32 GET_INFO command (0x01, info id 0x00)
+           *
+           * There is intentionally no firmware read, erase, program, reset,
+           * protection-change, download, upload, or jump functionality.
+           *
+           * Protocol behavior is based on WestberryTech/wb32-dfu-updater,
+           * audited at commit 656f6a56354de86a8213b0d2dc8349b0aeb4b67e.
+           */
+
+          #include <stdio.h>
+          #include <stdint.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <libusb-1.0/libusb.h>
+
+          #define WB_VID 0x342D
+          #define WB_DFU_PID 0xDFA0
+          #define WB_EP_OUT 0x01
+          #define WB_EP_IN  0x81
+          #define WB_CMD_GET_INFO 0x01
+          #define USB_TIMEOUT_MS 2000
+
+          static uint32_t le32(const unsigned char *p) {
+              return ((uint32_t)p[0]) |
+                     ((uint32_t)p[1] << 8) |
+                     ((uint32_t)p[2] << 16) |
+                     ((uint32_t)p[3] << 24);
+          }
+
+          static int is_target(libusb_device *dev, struct libusb_device_descriptor *desc) {
+              if (libusb_get_device_descriptor(dev, desc) != 0) return 0;
+              return desc->idVendor == WB_VID && desc->idProduct == WB_DFU_PID;
+          }
+
+          static int list_targets(libusb_context *ctx) {
+              libusb_device **list = NULL;
+              ssize_t n = libusb_get_device_list(ctx, &list);
+              if (n < 0) {
+                  fprintf(stderr, "libusb_get_device_list failed: %s\n",
+                          libusb_error_name((int)n));
+                  return 2;
+              }
+
+              int found = 0;
+              for (ssize_t i = 0; i < n; ++i) {
+                  struct libusb_device_descriptor d;
+                  if (!is_target(list[i], &d)) continue;
+                  ++found;
+                  printf("WB32_DFU_FOUND vid=%04X pid=%04X bus=%u address=%u bcdDevice=%04X\n",
+                         d.idVendor, d.idProduct,
+                         (unsigned)libusb_get_bus_number(list[i]),
+                         (unsigned)libusb_get_device_address(list[i]),
+                         d.bcdDevice);
+              }
+
+              libusb_free_device_list(list, 1);
+              printf("WB32_DFU_COUNT=%d\n", found);
+              return found ? 0 : 3;
+          }
+
+          static int verify_interface_shape(libusb_device *dev) {
+              struct libusb_config_descriptor *cfg = NULL;
+              int r = libusb_get_config_descriptor(dev, 0, &cfg);
+              if (r != 0 || !cfg) return 0;
+
+              int ok = 0;
+              if (cfg->bNumInterfaces == 1 &&
+                  cfg->interface[0].num_altsetting >= 1) {
+                  const struct libusb_interface_descriptor *it =
+                      &cfg->interface[0].altsetting[0];
+
+                  int have_in = 0, have_out = 0;
+                  for (int i = 0; i < it->bNumEndpoints; ++i) {
+                      unsigned char ep = it->endpoint[i].bEndpointAddress;
+                      if (ep == WB_EP_IN) have_in = 1;
+                      if (ep == WB_EP_OUT) have_out = 1;
+                  }
+
+                  ok = (it->bInterfaceClass == 0xFF &&
+                        it->bInterfaceSubClass == 0xFF &&
+                        it->bNumEndpoints == 2 &&
+                        have_in && have_out);
+              }
+
+              libusb_free_config_descriptor(cfg);
+              return ok;
+          }
+
+          static int query_info(libusb_context *ctx) {
+              libusb_device **list = NULL;
+              ssize_t n = libusb_get_device_list(ctx, &list);
+              if (n < 0) {
+                  fprintf(stderr, "libusb_get_device_list failed: %s\n",
+                          libusb_error_name((int)n));
+                  return 2;
+              }
+
+              libusb_device *target = NULL;
+              struct libusb_device_descriptor desc = {0};
+              int count = 0;
+
+              for (ssize_t i = 0; i < n; ++i) {
+                  struct libusb_device_descriptor d;
+                  if (!is_target(list[i], &d)) continue;
+                  target = list[i];
+                  desc = d;
+                  ++count;
+              }
+
+              if (count != 1 || !target) {
+                  fprintf(stderr, "INFO requires exactly one WB32 DFU device; found %d\n", count);
+                  libusb_free_device_list(list, 1);
+                  return 3;
+              }
+
+              if (!verify_interface_shape(target)) {
+                  fprintf(stderr, "Device USB interface shape does not match audited WB32 DFU.\n");
+                  libusb_free_device_list(list, 1);
+                  return 4;
+              }
+
+              libusb_device_handle *h = NULL;
+              int r = libusb_open(target, &h);
+              if (r != 0 || !h) {
+                  fprintf(stderr, "Cannot open WB32 DFU device: %s\n", libusb_error_name(r));
+                  libusb_free_device_list(list, 1);
+                  return 5;
+              }
+
+              unsigned char manufacturer[128] = {0};
+              unsigned char product[128] = {0};
+
+              if (desc.iManufacturer) {
+                  libusb_get_string_descriptor_ascii(
+                      h, desc.iManufacturer, manufacturer, sizeof(manufacturer) - 1);
+              }
+              if (desc.iProduct) {
+                  libusb_get_string_descriptor_ascii(
+                      h, desc.iProduct, product, sizeof(product) - 1);
+              }
+
+              printf("USB_MANUFACTURER=%s\n", manufacturer[0] ? (char *)manufacturer : "(unavailable)");
+              printf("USB_PRODUCT=%s\n", product[0] ? (char *)product : "(unavailable)");
+
+              r = libusb_claim_interface(h, 0);
+              if (r != 0) {
+                  fprintf(stderr, "Cannot claim interface 0: %s\n", libusb_error_name(r));
+                  libusb_close(h);
+                  libusb_free_device_list(list, 1);
+                  return 6;
+              }
+
+              /*
+               * The ONLY WB32 protocol command emitted by this program:
+               * GET_INFO (0x01), info_id 0x00.
+               */
+              unsigned char cmd[2] = {WB_CMD_GET_INFO, 0x00};
+              int transferred = 0;
+
+              r = libusb_bulk_transfer(
+                  h, WB_EP_OUT, cmd, (int)sizeof(cmd),
+                  &transferred, USB_TIMEOUT_MS);
+
+              if (r != 0 || transferred != (int)sizeof(cmd)) {
+                  fprintf(stderr, "GET_INFO OUT failed: %s transferred=%d\n",
+                          libusb_error_name(r), transferred);
+                  libusb_release_interface(h, 0);
+                  libusb_close(h);
+                  libusb_free_device_list(list, 1);
+                  return 7;
+              }
+
+              unsigned char rsp[256] = {0};
+              transferred = 0;
+              r = libusb_bulk_transfer(
+                  h, WB_EP_IN, rsp, (int)sizeof(rsp),
+                  &transferred, USB_TIMEOUT_MS);
+
+              libusb_release_interface(h, 0);
+              libusb_close(h);
+              libusb_free_device_list(list, 1);
+
+              if (r != 0) {
+                  fprintf(stderr, "GET_INFO IN failed: %s\n", libusb_error_name(r));
+                  return 8;
+              }
+              if (transferred < 16) {
+                  fprintf(stderr, "GET_INFO response too short: %d\n", transferred);
+                  return 9;
+              }
+              if (rsp[1] != 0x00) {
+                  fprintf(stderr, "GET_INFO status is not success: 0x%02X\n", rsp[1]);
+                  return 10;
+              }
+              if (rsp[2] < 13 || transferred < 3 + rsp[2]) {
+                  fprintf(stderr, "GET_INFO payload length invalid: %u / transferred=%d\n",
+                          rsp[2], transferred);
+                  return 11;
+              }
+
+              const unsigned char *info = &rsp[3];
+              uint8_t boot = info[0];
+              uint32_t chip_id = le32(&info[1]);
+              uint32_t flash_size = le32(&info[5]);
+              uint32_t sram_size = le32(&info[9]);
+
+              printf("GET_INFO_STATUS=PASS\n");
+              printf("BOOTLOADER_VERSION=%u.%u\n", boot >> 4, boot & 0x0F);
+              printf("CHIP_ID=0x%08X\n", chip_id);
+              printf("FLASH_SIZE_BYTES=%u\n", flash_size);
+              printf("FLASH_SIZE_KIB=%u\n", flash_size >> 10);
+              printf("SRAM_SIZE_BYTES=%u\n", sram_size);
+              printf("SRAM_SIZE_KIB=%u\n", sram_size >> 10);
+              printf("CHIP_ID_MASK_0x3FFF=0x%04X\n", chip_id & 0x3FFF);
+
+              return 0;
+          }
+
+          static void usage(const char *exe) {
+              fprintf(stderr,
+                      "R75 WB32 INFO-ONLY inspector\n"
+                      "Usage: %s --list | --info\n"
+                      "--list performs USB enumeration only.\n"
+                      "--info sends exactly one WB32 GET_INFO query.\n",
+                      exe);
+          }
+
+          int main(int argc, char **argv) {
+              if (argc != 2) {
+                  usage(argv[0]);
+                  return 64;
+              }
+
+              libusb_context *ctx = NULL;
+              int r = libusb_init(&ctx);
+              if (r != 0) {
+                  fprintf(stderr, "libusb_init failed: %s\n", libusb_error_name(r));
+                  return 2;
+              }
+
+              int rc;
+              if (strcmp(argv[1], "--list") == 0) {
+                  rc = list_targets(ctx);
+              } else if (strcmp(argv[1], "--info") == 0) {
+                  rc = query_info(ctx);
+              } else {
+                  usage(argv[0]);
+                  rc = 64;
+              }
+
+              libusb_exit(ctx);
+              return rc;
+          }
+          EOF
+
+          ACTUAL="$(sha256sum project/phase3a1/source/r75_wb32_info_only.c | awk '{print $1}')"
+          {
+            echo "expected=$EXPECTED_SOURCE_SHA256"
+            echo "actual=$ACTUAL"
+          } | tee project/phase3a1/report/SOURCE_HASH_MATCH.txt
+
+          if [ "$ACTUAL" != "$EXPECTED_SOURCE_SHA256" ]; then
+            echo "SAFETY STOP: Windows source differs from green Phase 3A source."
+            exit 2
+          fi
+
+          echo "PASS: source is byte-identical to green Phase 3A."             | tee -a project/phase3a1/report/SOURCE_HASH_MATCH.txt
+
+      - name: HARD GATE — source still contains only LIST and GET_INFO
+        shell: msys2 {0}
+        run: |
+          SRC="project/phase3a1/source/r75_wb32_info_only.c"
+
+          for banned in             "0x5E" "0X5E"             "0x6A" "0X6A"             "0x72" "0X72"             "0x83" "0X83"             "0x9B" "0X9B"             "CMD_ERASE" "CMD_WRITE_PAGE" "CMD_READ" "CMD_RESET" "CMD_GO"             "fn_unread_protection" "fn_program_page" "fn_erase"; do
+              if grep -q "$banned" "$SRC"; then
+                echo "SAFETY STOP: forbidden protocol/write token found: $banned"
+                exit 2
+              fi
+          done
+
+          test "$(grep -c '^#define WB_CMD_GET_INFO 0x01$' "$SRC")" -eq 1
+          test "$(grep -c 'unsigned char cmd\[2\] = {WB_CMD_GET_INFO, 0x00};' "$SRC")" -eq 1
+
+          echo "PASS: source contains no flash-read/write/erase/reset/go command constants."             | tee project/phase3a1/report/INFO_ONLY_GATE.txt
+
+      - name: Compile native Windows INFO-only executable
+        shell: msys2 {0}
+        run: |
+          gcc             -std=c11 -O2 -Wall -Wextra -Werror             -I/ucrt64/include/libusb-1.0             project/phase3a1/source/r75_wb32_info_only.c             -L/ucrt64/lib -lusb-1.0             -o project/phase3a1/artifact/r75_wb32_info_only.exe
+
+          cp /ucrt64/bin/libusb-1.0.dll             project/phase3a1/artifact/libusb-1.0.dll
+
+          file project/phase3a1/artifact/r75_wb32_info_only.exe             | tee project/phase3a1/report/WINDOWS_EXE_FILE.txt
+
+          sha256sum             project/phase3a1/artifact/r75_wb32_info_only.exe             project/phase3a1/artifact/libusb-1.0.dll             project/phase3a1/source/r75_wb32_info_only.c             | tee project/phase3a1/report/SHA256SUMS.txt
+
+      - name: Audit Windows executable imports
+        shell: msys2 {0}
+        run: |
+          EXE="project/phase3a1/artifact/r75_wb32_info_only.exe"
+
+          objdump -p "$EXE"             | grep -E "DLL Name|Subsystem|ImageBase"             | tee project/phase3a1/report/PE_IMPORTS.txt
+
+          objdump -x "$EXE"             > project/phase3a1/report/PE_FULL_HEADERS.txt
+
+          strings "$EXE"             | grep -E "GET_INFO|WB32|FLASH_SIZE|CHIP_ID|--list|--info"             | tee project/phase3a1/report/PE_SELECTED_STRINGS.txt || true
+
+      - name: Cloud smoke-test LIST ONLY — never INFO
+        shell: msys2 {0}
+        run: |
+          set +e
+          project/phase3a1/artifact/r75_wb32_info_only.exe --list             > project/phase3a1/report/CLOUD_LIST_ONLY.txt 2>&1
+          RC=$?
+          set -e
+
+          cat project/phase3a1/report/CLOUD_LIST_ONLY.txt
+          echo "exit_code=$RC"             | tee -a project/phase3a1/report/CLOUD_LIST_ONLY.txt
+
+          # 0 = WB32 DFU happened to be visible; 3 = none found.
+          # Both are valid for an enumeration-only smoke test.
+          if [ "$RC" -ne 0 ] && [ "$RC" -ne 3 ]; then
+            echo "SAFETY STOP: --list smoke test failed unexpectedly."
+            exit 2
+          fi
+
+          echo "PASS: cloud smoke-test invoked --list only; --info was NOT invoked."             | tee project/phase3a1/report/CLOUD_SMOKE_TEST_PASS.txt
+
+      - name: Create safety README
+        shell: msys2 {0}
+        run: |
+          cat > project/phase3a1/artifact/README_BEFORE_RUNNING.txt <<'EOF'
+          R75 WB32 INFO-ONLY INSPECTOR — PHASE 3A.1
+
+          This executable was built from the exact source that passed green Phase 3A.
+
+          Available modes:
+            --list   USB enumeration only.
+            --info   Sends exactly one WB32 GET_INFO (0x01) query.
+
+          The program intentionally contains NO WB32 commands for:
+            firmware read
+            erase
+            program/write
+            reset
+            jump/go
+            read-protection removal
+
+          IMPORTANT:
+          - Do not run the official wb32-dfu-updater_cli -U, -D, or -t.
+          - Do not flash anything.
+          - Do not install/change a USB driver yet unless the next reviewed phase
+            explicitly requires it.
+          - Phase 3A.1 is only a Windows tool build; physical-device testing is a
+            separate later step.
+          EOF
+
+      - name: Final artifact safety audit
+        shell: msys2 {0}
+        run: |
+          ART="project/phase3a1/artifact"
+
+          test -f "$ART/r75_wb32_info_only.exe"
+          test -f "$ART/libusb-1.0.dll"
+          test -f "$ART/README_BEFORE_RUNNING.txt"
+
+          if find "$ART" -type f             \( -name "*.hex" -o -name "*.bin" -o -name "*.uf2" \)             | grep -q .; then
+            echo "SAFETY STOP: firmware image found in Windows tool artifact."
+            exit 2
+          fi
+
+          if find "$ART" -type f -iname "*wb32-dfu-updater*" | grep -q .; then
+            echo "SAFETY STOP: official full updater binary unexpectedly present."
+            exit 2
+          fi
+
+          echo "PASS: artifact contains INFO-only Windows tool, libusb DLL, and README only."             | tee project/phase3a1/report/FINAL_AUDIT.txt
+
+      - name: Upload Windows INFO-only tool + audit reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: R75_PHASE3A1_WINDOWS_INFO_ONLY_TOOL
+          path: |
+            project/phase3a1/artifact/
+            project/phase3a1/report/
+            project/phase3a1/source/
+          if-no-files-found: errorname: "03A.1 R75 SAFE Windows INFO-only build (NO DEVICE INFO / NO FLASH)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build_windows_info_only:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    env:
+      EXPECTED_SOURCE_SHA256: 50b1bf8243b306c509b9cd221be79b6cda3cde4c075a30d55b8a9e6226e99296
+
+    steps:
+      - name: Checkout this project
+        uses: actions/checkout@v4
+        with:
+          path: project
+
+      - name: Setup MSYS2 UCRT64 build environment
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-libusb
+
+      - name: Create Phase 3A.1 directories
+        shell: msys2 {0}
+        run: |
+          mkdir -p project/phase3a1/source
+          mkdir -p project/phase3a1/report
+          mkdir -p project/phase3a1/artifact
+
+      - name: Generate EXACT green Phase 3A audited source
+        shell: msys2 {0}
+        run: |
+          cat > project/phase3a1/source/r75_wb32_info_only.c <<'EOF'
+          /*
+           * R75 / WB32 DFU INFO-ONLY inspector.
+           *
+           * Purpose:
+           *   --list : enumerate only WB32 factory DFU USB ID 342D:DFA0
+           *   --info : issue exactly one WB32 GET_INFO command (0x01, info id 0x00)
+           *
+           * There is intentionally no firmware read, erase, program, reset,
+           * protection-change, download, upload, or jump functionality.
+           *
+           * Protocol behavior is based on WestberryTech/wb32-dfu-updater,
+           * audited at commit 656f6a56354de86a8213b0d2dc8349b0aeb4b67e.
+           */
+
+          #include <stdio.h>
+          #include <stdint.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <libusb-1.0/libusb.h>
+
+          #define WB_VID 0x342D
+          #define WB_DFU_PID 0xDFA0
+          #define WB_EP_OUT 0x01
+          #define WB_EP_IN  0x81
+          #define WB_CMD_GET_INFO 0x01
+          #define USB_TIMEOUT_MS 2000
+
+          static uint32_t le32(const unsigned char *p) {
+              return ((uint32_t)p[0]) |
+                     ((uint32_t)p[1] << 8) |
+                     ((uint32_t)p[2] << 16) |
+                     ((uint32_t)p[3] << 24);
+          }
+
+          static int is_target(libusb_device *dev, struct libusb_device_descriptor *desc) {
+              if (libusb_get_device_descriptor(dev, desc) != 0) return 0;
+              return desc->idVendor == WB_VID && desc->idProduct == WB_DFU_PID;
+          }
+
+          static int list_targets(libusb_context *ctx) {
+              libusb_device **list = NULL;
+              ssize_t n = libusb_get_device_list(ctx, &list);
+              if (n < 0) {
+                  fprintf(stderr, "libusb_get_device_list failed: %s\n",
+                          libusb_error_name((int)n));
+                  return 2;
+              }
+
+              int found = 0;
+              for (ssize_t i = 0; i < n; ++i) {
+                  struct libusb_device_descriptor d;
+                  if (!is_target(list[i], &d)) continue;
+                  ++found;
+                  printf("WB32_DFU_FOUND vid=%04X pid=%04X bus=%u address=%u bcdDevice=%04X\n",
+                         d.idVendor, d.idProduct,
+                         (unsigned)libusb_get_bus_number(list[i]),
+                         (unsigned)libusb_get_device_address(list[i]),
+                         d.bcdDevice);
+              }
+
+              libusb_free_device_list(list, 1);
+              printf("WB32_DFU_COUNT=%d\n", found);
+              return found ? 0 : 3;
+          }
+
+          static int verify_interface_shape(libusb_device *dev) {
+              struct libusb_config_descriptor *cfg = NULL;
+              int r = libusb_get_config_descriptor(dev, 0, &cfg);
+              if (r != 0 || !cfg) return 0;
+
+              int ok = 0;
+              if (cfg->bNumInterfaces == 1 &&
+                  cfg->interface[0].num_altsetting >= 1) {
+                  const struct libusb_interface_descriptor *it =
+                      &cfg->interface[0].altsetting[0];
+
+                  int have_in = 0, have_out = 0;
+                  for (int i = 0; i < it->bNumEndpoints; ++i) {
+                      unsigned char ep = it->endpoint[i].bEndpointAddress;
+                      if (ep == WB_EP_IN) have_in = 1;
+                      if (ep == WB_EP_OUT) have_out = 1;
+                  }
+
+                  ok = (it->bInterfaceClass == 0xFF &&
+                        it->bInterfaceSubClass == 0xFF &&
+                        it->bNumEndpoints == 2 &&
+                        have_in && have_out);
+              }
+
+              libusb_free_config_descriptor(cfg);
+              return ok;
+          }
+
+          static int query_info(libusb_context *ctx) {
+              libusb_device **list = NULL;
+              ssize_t n = libusb_get_device_list(ctx, &list);
+              if (n < 0) {
+                  fprintf(stderr, "libusb_get_device_list failed: %s\n",
+                          libusb_error_name((int)n));
+                  return 2;
+              }
+
+              libusb_device *target = NULL;
+              struct libusb_device_descriptor desc = {0};
+              int count = 0;
+
+              for (ssize_t i = 0; i < n; ++i) {
+                  struct libusb_device_descriptor d;
+                  if (!is_target(list[i], &d)) continue;
+                  target = list[i];
+                  desc = d;
+                  ++count;
+              }
+
+              if (count != 1 || !target) {
+                  fprintf(stderr, "INFO requires exactly one WB32 DFU device; found %d\n", count);
+                  libusb_free_device_list(list, 1);
+                  return 3;
+              }
+
+              if (!verify_interface_shape(target)) {
+                  fprintf(stderr, "Device USB interface shape does not match audited WB32 DFU.\n");
+                  libusb_free_device_list(list, 1);
+                  return 4;
+              }
+
+              libusb_device_handle *h = NULL;
+              int r = libusb_open(target, &h);
+              if (r != 0 || !h) {
+                  fprintf(stderr, "Cannot open WB32 DFU device: %s\n", libusb_error_name(r));
+                  libusb_free_device_list(list, 1);
+                  return 5;
+              }
+
+              unsigned char manufacturer[128] = {0};
+              unsigned char product[128] = {0};
+
+              if (desc.iManufacturer) {
+                  libusb_get_string_descriptor_ascii(
+                      h, desc.iManufacturer, manufacturer, sizeof(manufacturer) - 1);
+              }
+              if (desc.iProduct) {
+                  libusb_get_string_descriptor_ascii(
+                      h, desc.iProduct, product, sizeof(product) - 1);
+              }
+
+              printf("USB_MANUFACTURER=%s\n", manufacturer[0] ? (char *)manufacturer : "(unavailable)");
+              printf("USB_PRODUCT=%s\n", product[0] ? (char *)product : "(unavailable)");
+
+              r = libusb_claim_interface(h, 0);
+              if (r != 0) {
+                  fprintf(stderr, "Cannot claim interface 0: %s\n", libusb_error_name(r));
+                  libusb_close(h);
+                  libusb_free_device_list(list, 1);
+                  return 6;
+              }
+
+              /*
+               * The ONLY WB32 protocol command emitted by this program:
+               * GET_INFO (0x01), info_id 0x00.
+               */
+              unsigned char cmd[2] = {WB_CMD_GET_INFO, 0x00};
+              int transferred = 0;
+
+              r = libusb_bulk_transfer(
+                  h, WB_EP_OUT, cmd, (int)sizeof(cmd),
+                  &transferred, USB_TIMEOUT_MS);
+
+              if (r != 0 || transferred != (int)sizeof(cmd)) {
+                  fprintf(stderr, "GET_INFO OUT failed: %s transferred=%d\n",
+                          libusb_error_name(r), transferred);
+                  libusb_release_interface(h, 0);
+                  libusb_close(h);
+                  libusb_free_device_list(list, 1);
+                  return 7;
+              }
+
+              unsigned char rsp[256] = {0};
+              transferred = 0;
+              r = libusb_bulk_transfer(
+                  h, WB_EP_IN, rsp, (int)sizeof(rsp),
+                  &transferred, USB_TIMEOUT_MS);
+
+              libusb_release_interface(h, 0);
+              libusb_close(h);
+              libusb_free_device_list(list, 1);
+
+              if (r != 0) {
+                  fprintf(stderr, "GET_INFO IN failed: %s\n", libusb_error_name(r));
+                  return 8;
+              }
+              if (transferred < 16) {
+                  fprintf(stderr, "GET_INFO response too short: %d\n", transferred);
+                  return 9;
+              }
+              if (rsp[1] != 0x00) {
+                  fprintf(stderr, "GET_INFO status is not success: 0x%02X\n", rsp[1]);
+                  return 10;
+              }
+              if (rsp[2] < 13 || transferred < 3 + rsp[2]) {
+                  fprintf(stderr, "GET_INFO payload length invalid: %u / transferred=%d\n",
+                          rsp[2], transferred);
+                  return 11;
+              }
+
+              const unsigned char *info = &rsp[3];
+              uint8_t boot = info[0];
+              uint32_t chip_id = le32(&info[1]);
+              uint32_t flash_size = le32(&info[5]);
+              uint32_t sram_size = le32(&info[9]);
+
+              printf("GET_INFO_STATUS=PASS\n");
+              printf("BOOTLOADER_VERSION=%u.%u\n", boot >> 4, boot & 0x0F);
+              printf("CHIP_ID=0x%08X\n", chip_id);
+              printf("FLASH_SIZE_BYTES=%u\n", flash_size);
+              printf("FLASH_SIZE_KIB=%u\n", flash_size >> 10);
+              printf("SRAM_SIZE_BYTES=%u\n", sram_size);
+              printf("SRAM_SIZE_KIB=%u\n", sram_size >> 10);
+              printf("CHIP_ID_MASK_0x3FFF=0x%04X\n", chip_id & 0x3FFF);
+
+              return 0;
+          }
+
+          static void usage(const char *exe) {
+              fprintf(stderr,
+                      "R75 WB32 INFO-ONLY inspector\n"
+                      "Usage: %s --list | --info\n"
+                      "--list performs USB enumeration only.\n"
+                      "--info sends exactly one WB32 GET_INFO query.\n",
+                      exe);
+          }
+
+          int main(int argc, char **argv) {
+              if (argc != 2) {
+                  usage(argv[0]);
+                  return 64;
+              }
+
+              libusb_context *ctx = NULL;
+              int r = libusb_init(&ctx);
+              if (r != 0) {
+                  fprintf(stderr, "libusb_init failed: %s\n", libusb_error_name(r));
+                  return 2;
+              }
+
+              int rc;
+              if (strcmp(argv[1], "--list") == 0) {
+                  rc = list_targets(ctx);
+              } else if (strcmp(argv[1], "--info") == 0) {
+                  rc = query_info(ctx);
+              } else {
+                  usage(argv[0]);
+                  rc = 64;
+              }
+
+              libusb_exit(ctx);
+              return rc;
+          }
+          EOF
+
+          ACTUAL="$(sha256sum project/phase3a1/source/r75_wb32_info_only.c | awk '{print $1}')"
+          {
+            echo "expected=$EXPECTED_SOURCE_SHA256"
+            echo "actual=$ACTUAL"
+          } | tee project/phase3a1/report/SOURCE_HASH_MATCH.txt
+
+          if [ "$ACTUAL" != "$EXPECTED_SOURCE_SHA256" ]; then
+            echo "SAFETY STOP: Windows source differs from green Phase 3A source."
+            exit 2
+          fi
+
+          echo "PASS: source is byte-identical to green Phase 3A."             | tee -a project/phase3a1/report/SOURCE_HASH_MATCH.txt
+
+      - name: HARD GATE — source still contains only LIST and GET_INFO
+        shell: msys2 {0}
+        run: |
+          SRC="project/phase3a1/source/r75_wb32_info_only.c"
+
+          for banned in             "0x5E" "0X5E"             "0x6A" "0X6A"             "0x72" "0X72"             "0x83" "0X83"             "0x9B" "0X9B"             "CMD_ERASE" "CMD_WRITE_PAGE" "CMD_READ" "CMD_RESET" "CMD_GO"             "fn_unread_protection" "fn_program_page" "fn_erase"; do
+              if grep -q "$banned" "$SRC"; then
+                echo "SAFETY STOP: forbidden protocol/write token found: $banned"
+                exit 2
+              fi
+          done
+
+          test "$(grep -c '^#define WB_CMD_GET_INFO 0x01$' "$SRC")" -eq 1
+          test "$(grep -c 'unsigned char cmd\[2\] = {WB_CMD_GET_INFO, 0x00};' "$SRC")" -eq 1
+
+          echo "PASS: source contains no flash-read/write/erase/reset/go command constants."             | tee project/phase3a1/report/INFO_ONLY_GATE.txt
+
+      - name: Compile native Windows INFO-only executable
+        shell: msys2 {0}
+        run: |
+          gcc             -std=c11 -O2 -Wall -Wextra -Werror             -I/ucrt64/include/libusb-1.0             project/phase3a1/source/r75_wb32_info_only.c             -L/ucrt64/lib -lusb-1.0             -o project/phase3a1/artifact/r75_wb32_info_only.exe
+
+          cp /ucrt64/bin/libusb-1.0.dll             project/phase3a1/artifact/libusb-1.0.dll
+
+          file project/phase3a1/artifact/r75_wb32_info_only.exe             | tee project/phase3a1/report/WINDOWS_EXE_FILE.txt
+
+          sha256sum             project/phase3a1/artifact/r75_wb32_info_only.exe             project/phase3a1/artifact/libusb-1.0.dll             project/phase3a1/source/r75_wb32_info_only.c             | tee project/phase3a1/report/SHA256SUMS.txt
+
+      - name: Audit Windows executable imports
+        shell: msys2 {0}
+        run: |
+          EXE="project/phase3a1/artifact/r75_wb32_info_only.exe"
+
+          objdump -p "$EXE"             | grep -E "DLL Name|Subsystem|ImageBase"             | tee project/phase3a1/report/PE_IMPORTS.txt
+
+          objdump -x "$EXE"             > project/phase3a1/report/PE_FULL_HEADERS.txt
+
+          strings "$EXE"             | grep -E "GET_INFO|WB32|FLASH_SIZE|CHIP_ID|--list|--info"             | tee project/phase3a1/report/PE_SELECTED_STRINGS.txt || true
+
+      - name: Cloud smoke-test LIST ONLY — never INFO
+        shell: msys2 {0}
+        run: |
+          set +e
+          project/phase3a1/artifact/r75_wb32_info_only.exe --list             > project/phase3a1/report/CLOUD_LIST_ONLY.txt 2>&1
+          RC=$?
+          set -e
+
+          cat project/phase3a1/report/CLOUD_LIST_ONLY.txt
+          echo "exit_code=$RC"             | tee -a project/phase3a1/report/CLOUD_LIST_ONLY.txt
+
+          # 0 = WB32 DFU happened to be visible; 3 = none found.
+          # Both are valid for an enumeration-only smoke test.
+          if [ "$RC" -ne 0 ] && [ "$RC" -ne 3 ]; then
+            echo "SAFETY STOP: --list smoke test failed unexpectedly."
+            exit 2
+          fi
+
+          echo "PASS: cloud smoke-test invoked --list only; --info was NOT invoked."             | tee project/phase3a1/report/CLOUD_SMOKE_TEST_PASS.txt
+
+      - name: Create safety README
+        shell: msys2 {0}
+        run: |
+          cat > project/phase3a1/artifact/README_BEFORE_RUNNING.txt <<'EOF'
+          R75 WB32 INFO-ONLY INSPECTOR — PHASE 3A.1
+
+          This executable was built from the exact source that passed green Phase 3A.
+
+          Available modes:
+            --list   USB enumeration only.
+            --info   Sends exactly one WB32 GET_INFO (0x01) query.
+
+          The program intentionally contains NO WB32 commands for:
+            firmware read
+            erase
+            program/write
+            reset
+            jump/go
+            read-protection removal
+
+          IMPORTANT:
+          - Do not run the official wb32-dfu-updater_cli -U, -D, or -t.
+          - Do not flash anything.
+          - Do not install/change a USB driver yet unless the next reviewed phase
+            explicitly requires it.
+          - Phase 3A.1 is only a Windows tool build; physical-device testing is a
+            separate later step.
+          EOF
+
+      - name: Final artifact safety audit
+        shell: msys2 {0}
+        run: |
+          ART="project/phase3a1/artifact"
+
+          test -f "$ART/r75_wb32_info_only.exe"
+          test -f "$ART/libusb-1.0.dll"
+          test -f "$ART/README_BEFORE_RUNNING.txt"
+
+          if find "$ART" -type f             \( -name "*.hex" -o -name "*.bin" -o -name "*.uf2" \)             | grep -q .; then
+            echo "SAFETY STOP: firmware image found in Windows tool artifact."
+            exit 2
+          fi
+
+          if find "$ART" -type f -iname "*wb32-dfu-updater*" | grep -q .; then
+            echo "SAFETY STOP: official full updater binary unexpectedly present."
+            exit 2
+          fi
+
+          echo "PASS: artifact contains INFO-only Windows tool, libusb DLL, and README only."             | tee project/phase3a1/report/FINAL_AUDIT.txt
+
+      - name: Upload Windows INFO-only tool + audit reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: R75_PHASE3A1_WINDOWS_INFO_ONLY_TOOL
+          path: |
+            project/phase3a1/artifact/
+            project/phase3a1/report/
+            project/phase3a1/source/
+          if-no-files-found: error
