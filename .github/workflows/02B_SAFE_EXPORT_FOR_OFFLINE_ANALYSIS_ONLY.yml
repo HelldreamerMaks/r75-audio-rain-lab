@@ -1,0 +1,273 @@
+name: "02B R75 SAFE export for offline analysis only (NO FLASH)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build_and_export_analysis_copy:
+    runs-on: ubuntu-latest
+    container: ghcr.io/qmk/qmk_cli:latest
+    timeout-minutes: 45
+
+    env:
+      QMK_COMMIT: b4a935015022a26b184d859a70876d425b6f8c5b
+      EXPECTED_HEX_SHA256: fc65fe7e4ece336d6b5c5e19419957340e0336e9528a679377e74b41d3bdc7c8
+      EXPECTED_BIN_SHA256: 13246442a278f25975cc18d8bcff2ba695c4f5672df5045d7982c01d030b1a38
+
+    steps:
+      - name: Disable git safe-directory checks in disposable runner
+        run: git config --global --add safe.directory '*'
+
+      - name: Checkout analysis project
+        uses: actions/checkout@v4
+        with:
+          path: project
+
+      - name: Checkout EXACT audited R75 QMK commit
+        uses: actions/checkout@v4
+        with:
+          repository: snakkarike/qmk_firmware
+          ref: b4a935015022a26b184d859a70876d425b6f8c5b
+          submodules: recursive
+          fetch-depth: 1
+          path: qmk
+
+      - name: Create Phase 2B report directories
+        shell: bash
+        run: |
+          mkdir -p project/phase2b_artifact/reports
+          mkdir -p project/phase2b_artifact/analysis_payload
+
+      - name: Verify exact source commit and record environment
+        shell: bash
+        run: |
+          ACTUAL="$(git -C qmk rev-parse HEAD)"
+          test "$ACTUAL" = "$QMK_COMMIT"
+
+          {
+            echo "PHASE=2B"
+            echo "PURPOSE=offline analysis only"
+            echo "FLASHING=forbidden/not performed"
+            echo "EXPECTED_COMMIT=$QMK_COMMIT"
+            echo "ACTUAL_COMMIT=$ACTUAL"
+            echo
+            qmk --version || true
+            arm-none-eabi-gcc --version | head -n 1 || true
+          } | tee project/phase2b_artifact/reports/ENVIRONMENT.txt
+
+      - name: Verify pristine checkout before overlay
+        shell: bash
+        run: |
+          git -C qmk status --short \
+            | tee project/phase2b_artifact/reports/GIT_STATUS_BEFORE.txt
+          test -z "$(git -C qmk status --porcelain)"
+
+      - name: Apply exact Audio Spawn Rain overlay
+        shell: bash
+        run: |
+          python3 project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD/scripts/apply_overlay.py \
+            project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD \
+            qmk
+
+      - name: Verify overlay bytes, LED81, and build flags
+        shell: bash
+        run: |
+          TARGET="qmk/keyboards/rk/r75/iso/keymaps/via"
+          SOURCE="project/R75_AudioSpawnRain_v12_2_GitHub_SAFE_BUILD"
+
+          test -f "$TARGET/audio_rain.c"
+          test -f "$TARGET/rgb_matrix_user.inc"
+          test -f "$TARGET/config.h"
+          test -f "$TARGET/rules.mk"
+
+          cmp -s "$SOURCE/overlay/audio_rain.c" "$TARGET/audio_rain.c"
+          cmp -s "$SOURCE/overlay/rgb_matrix_user.inc" "$TARGET/rgb_matrix_user.inc"
+          cmp -s "$SOURCE/candidate81/config.h" "$TARGET/config.h"
+
+          grep -Fx "#define RGB_MATRIX_LED_COUNT 81" "$TARGET/config.h"
+          grep -Fx "RGB_MATRIX_CUSTOM_USER = yes" "$TARGET/rules.mk"
+          grep -Fx "SRC += audio_rain.c" "$TARGET/rules.mk"
+
+          {
+            echo "===== Overlay SHA-256 ====="
+            sha256sum \
+              "$TARGET/audio_rain.c" \
+              "$TARGET/rgb_matrix_user.inc" \
+              "$TARGET/config.h"
+            echo
+            echo "===== rules.mk delta ====="
+            git -C qmk diff -- keyboards/rk/r75/iso/keymaps/via/rules.mk
+          } | tee project/phase2b_artifact/reports/OVERLAY_VERIFICATION.txt
+
+      - name: Compile ISO E483 Audio Spawn Rain candidate — COMPILE ONLY
+        working-directory: qmk
+        shell: bash
+        run: |
+          set -o pipefail
+          qmk compile -j 0 -kb rk/r75/iso -km via \
+            2>&1 | tee ../project/phase2b_artifact/reports/COMPILE.log
+
+      - name: Require successful Audio Rain compile and final link
+        shell: bash
+        run: |
+          grep -F "audio_rain.c" project/phase2b_artifact/reports/COMPILE.log | grep -F "[OK]"
+          grep -F "Linking:" project/phase2b_artifact/reports/COMPILE.log | grep -F "[OK]"
+          grep -F "rk_r75_iso_via.hex" project/phase2b_artifact/reports/COMPILE.log | grep -F "[OK]"
+          grep -F "rk_r75_iso_via.bin" project/phase2b_artifact/reports/COMPILE.log | grep -F "[OK]"
+
+      - name: Locate ONLY the expected R75 candidate outputs
+        working-directory: qmk
+        shell: bash
+        run: |
+          HEX=".build/rk_r75_iso_via.hex"
+          BIN=".build/rk_r75_iso_via.bin"
+          ELF=".build/rk_r75_iso_via.elf"
+
+          test -f "$HEX"
+          test -f "$BIN"
+          test -f "$ELF"
+
+          {
+            echo "HEX=$HEX"
+            echo "BIN=$BIN"
+            echo "ELF=$ELF"
+            echo "HEX_SIZE=$(stat -c '%s' "$HEX")"
+            echo "BIN_SIZE=$(stat -c '%s' "$BIN")"
+            echo "ELF_SIZE=$(stat -c '%s' "$ELF")"
+          } | tee ../project/phase2b_artifact/reports/OUTPUT_FILES.txt
+
+      - name: HARD GATE — candidate SHA-256 must equal green Phase 2A FINAL
+        working-directory: qmk
+        shell: bash
+        run: |
+          HEX=".build/rk_r75_iso_via.hex"
+          BIN=".build/rk_r75_iso_via.bin"
+
+          ACTUAL_HEX="$(sha256sum "$HEX" | awk '{print $1}')"
+          ACTUAL_BIN="$(sha256sum "$BIN" | awk '{print $1}')"
+
+          {
+            echo "expected_hex=$EXPECTED_HEX_SHA256"
+            echo "actual_hex=$ACTUAL_HEX"
+            echo "expected_bin=$EXPECTED_BIN_SHA256"
+            echo "actual_bin=$ACTUAL_BIN"
+          } | tee ../project/phase2b_artifact/reports/PHASE2A_HASH_MATCH.txt
+
+          if [ "$ACTUAL_HEX" != "$EXPECTED_HEX_SHA256" ]; then
+            echo "SAFETY STOP: HEX differs from the green Phase 2A FINAL candidate."
+            exit 2
+          fi
+
+          if [ "$ACTUAL_BIN" != "$EXPECTED_BIN_SHA256" ]; then
+            echo "SAFETY STOP: BIN differs from the green Phase 2A FINAL candidate."
+            exit 2
+          fi
+
+          echo "PASS: candidate is byte-identical to green Phase 2A FINAL." \
+            | tee -a ../project/phase2b_artifact/reports/PHASE2A_HASH_MATCH.txt
+
+      - name: Produce offline ELF analysis reports
+        working-directory: qmk
+        shell: bash
+        run: |
+          ELF=".build/rk_r75_iso_via.elf"
+
+          arm-none-eabi-size "$ELF" \
+            | tee ../project/phase2b_artifact/reports/ELF_SIZE.txt
+
+          arm-none-eabi-objdump -h "$ELF" \
+            > ../project/phase2b_artifact/reports/ELF_SECTIONS.txt
+
+          arm-none-eabi-nm -a -S --size-sort "$ELF" \
+            > ../project/phase2b_artifact/reports/ELF_SYMBOLS_FULL.txt
+
+          arm-none-eabi-nm -a -S "$ELF" \
+            | grep -E 'audio_rain|g_audio_rain|rgb_matrix|via_command' \
+            > ../project/phase2b_artifact/reports/AUDIO_RAIN_SYMBOLS.txt || true
+
+          grep -q "g_audio_rain_spawn_gate" \
+            ../project/phase2b_artifact/reports/AUDIO_RAIN_SYMBOLS.txt
+          grep -q "g_audio_rain_last_packet_ms" \
+            ../project/phase2b_artifact/reports/AUDIO_RAIN_SYMBOLS.txt
+
+      - name: Export renamed ANALYSIS-ONLY copies
+        working-directory: qmk
+        shell: bash
+        run: |
+          DEST="../project/phase2b_artifact/analysis_payload"
+
+          cp ".build/rk_r75_iso_via.hex" \
+            "$DEST/RK_R75_ISO_E483_AUDIO_RAIN_DO_NOT_FLASH.hex.analysis_only"
+
+          cp ".build/rk_r75_iso_via.bin" \
+            "$DEST/RK_R75_ISO_E483_AUDIO_RAIN_DO_NOT_FLASH.bin.analysis_only"
+
+          cp ".build/rk_r75_iso_via.elf" \
+            "$DEST/RK_R75_ISO_E483_AUDIO_RAIN.elf.analysis_only"
+
+          {
+            echo "WARNING"
+            echo "======="
+            echo "These files are exported ONLY for offline inspection."
+            echo "They are deliberately renamed to discourage accidental flashing."
+            echo "Renaming does NOT make firmware technically unflashable."
+            echo
+            echo "DO NOT flash any of these files to a keyboard."
+            echo "No recovery/backup gate has been completed yet."
+            echo
+            echo "Source commit:"
+            echo "$QMK_COMMIT"
+            echo
+            echo "Expected green Phase 2A FINAL hashes:"
+            echo "HEX $EXPECTED_HEX_SHA256"
+            echo "BIN $EXPECTED_BIN_SHA256"
+          } > "$DEST/README_DO_NOT_FLASH.txt"
+
+          sha256sum "$DEST"/* \
+            > ../project/phase2b_artifact/reports/EXPORTED_FILES_SHA256.txt
+
+      - name: Delete original flash-named images from QMK build tree
+        working-directory: qmk
+        shell: bash
+        run: |
+          rm -f ".build/rk_r75_iso_via.hex"
+          rm -f ".build/rk_r75_iso_via.bin"
+
+          test ! -f ".build/rk_r75_iso_via.hex"
+          test ! -f ".build/rk_r75_iso_via.bin"
+
+          echo "PASS: original flash-named candidate HEX/BIN removed." \
+            | tee ../project/phase2b_artifact/reports/ORIGINAL_IMAGES_REMOVED.txt
+
+      - name: Final Phase 2B payload audit
+        shell: bash
+        run: |
+          PAYLOAD="project/phase2b_artifact/analysis_payload"
+
+          test -f "$PAYLOAD/RK_R75_ISO_E483_AUDIO_RAIN_DO_NOT_FLASH.hex.analysis_only"
+          test -f "$PAYLOAD/RK_R75_ISO_E483_AUDIO_RAIN_DO_NOT_FLASH.bin.analysis_only"
+          test -f "$PAYLOAD/RK_R75_ISO_E483_AUDIO_RAIN.elf.analysis_only"
+          test -f "$PAYLOAD/README_DO_NOT_FLASH.txt"
+
+          test "$(find "$PAYLOAD" -maxdepth 1 -type f | wc -l)" -eq 4
+
+          # Refuse normal flash-image extensions inside the exported artifact.
+          if find project/phase2b_artifact -type f \
+            \( -name "*.hex" -o -name "*.bin" -o -name "*.uf2" \) \
+            | grep -q .; then
+            echo "SAFETY STOP: normal flash-image extension found in artifact."
+            exit 2
+          fi
+
+          echo "PASS: Phase 2B contains only renamed analysis copies + reports." \
+            | tee project/phase2b_artifact/reports/FINAL_AUDIT.txt
+
+      - name: Upload Phase 2B ANALYSIS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: R75_PHASE2B_OFFLINE_ANALYSIS_ONLY_DO_NOT_FLASH
+          path: project/phase2b_artifact/
+          if-no-files-found: error
